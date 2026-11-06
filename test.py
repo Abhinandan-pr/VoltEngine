@@ -4,6 +4,7 @@ from datetime import datetime
 import calendar
 import tempfile
 import os
+import math
 
 # Attempt to import FPDF for PDF Generation
 try:
@@ -287,6 +288,9 @@ class Consumer:
 class PaymentEngine:
     @staticmethod
     def process_recharge(consumer, amount):
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("Recharge amount must be a positive finite number.")
         consumer.wallet_balance += amount
         remarks = "Wallet Recharge"
         if consumer.wallet_balance >= 0 and consumer.status == "DISCONNECTED":
@@ -303,6 +307,14 @@ class PaymentEngine:
 
     @staticmethod
     def process_arrear_payment(consumer, amount, recovery_days):
+        amount = float(amount)
+        recovery_days = int(recovery_days)
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("Arrear payment must be a positive finite number.")
+        if recovery_days <= 0:
+            raise ValueError("Recovery period must be at least one day.")
+        if consumer.arrear_balance <= 0:
+            raise ValueError("There is no outstanding arrear to pay.")
         paid_amount = min(amount, consumer.arrear_balance)
         consumer.arrear_balance -= paid_amount
         if consumer.arrear_balance > 0:
@@ -316,6 +328,11 @@ class PaymentEngine:
 class SlabEngine:
     @staticmethod
     def calculate_energy_charge_with_breakdown(units, slabs):
+        units = float(units)
+        if not math.isfinite(units) or units < 0:
+            raise ValueError("Units must be a non-negative finite number.")
+        if not slabs:
+            raise ValueError("At least one tariff slab is required.")
         sorted_slabs = sorted(slabs, key=lambda x: x['Upto KWh'])
         charge = 0.0
         remaining_units = units
@@ -343,8 +360,26 @@ class SlabEngine:
 class MigrationEngine:
     @staticmethod
     def migrate(old_acc, name, address, category_id, old_arrear, security_dep, load, prev_r, mig_r, mig_date, recovery_days=365):
+        if DataManager.get_consumer(f"PRE-{old_acc}"):
+            raise ValueError(f"Consumer PRE-{old_acc} already exists.")
+        values = {
+            "Old arrears": old_arrear,
+            "Security deposit": security_dep,
+            "Load": load,
+            "Previous reading": prev_r,
+            "Migration reading": mig_r,
+        }
+        for label, value in values.items():
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{label} must be a non-negative finite number.")
+        if float(mig_r) < float(prev_r):
+            raise ValueError("Migration reading cannot be below the previous billed reading.")
+        if int(recovery_days) <= 0:
+            raise ValueError("Recovery period must be at least one day.")
         unbilled_units = max(0, mig_r - prev_r)
         tariff = DataManager.get_tariff(category_id)
+        if not tariff:
+            raise ValueError("Unknown tariff category.")
         
         # Legacy meters do NOT have ToD slots. The unbilled period is strictly flat-rate.
         gross_ec, slab_breakdown = SlabEngine.calculate_energy_charge_with_breakdown(unbilled_units, tariff['slabs'])
@@ -380,6 +415,13 @@ class MigrationEngine:
 
 class PrepaidDailyBilling:
     def run(self, consumer, units_normal, units_offpeak, units_peak, max_demand, date_val, is_meter_change=False, is_non_com=False):
+        for label, value in (("Normal units", units_normal), ("Off-peak units", units_offpeak),
+                             ("Peak units", units_peak), ("Maximum demand", max_demand)):
+            if not math.isfinite(float(value)) or float(value) < 0:
+                return {"error": f"{label} must be a non-negative finite number."}
+        units_normal, units_offpeak, units_peak, max_demand = map(
+            float, (units_normal, units_offpeak, units_peak, max_demand)
+        )
         tariff = DataManager.get_tariff(consumer.category_id)
         if not tariff: return {"error": "Invalid Tariff Category"}
 
@@ -614,10 +656,13 @@ with tabs[1]:
         st.error("⚠️ Previous Billed Reading cannot be greater than the Migration Day Reading!")
     else:
         if st.button("Migrate to Prepaid"):
-            c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
-            DataManager.save_consumer(c)
-            st.success(f"Migrated: {c.consumer_id}")
-            st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.generate_conversion_bill(c, pdf_details)
+            try:
+                c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
+                DataManager.save_consumer(c)
+                st.success(f"Migrated: {c.consumer_id}")
+                st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.generate_conversion_bill(c, pdf_details)
+            except (ValueError, TypeError) as exc:
+                st.error(str(exc))
 
     if f"pdf_PRE-{acc}_mig" in st.session_state and isinstance(st.session_state[f"pdf_PRE-{acc}_mig"], bytes):
         st.download_button("⬇️ Download Final Conversion Bill PDF", data=st.session_state[f"pdf_PRE-{acc}_mig"], 
@@ -732,16 +777,22 @@ with tabs[6]:
         c = DataManager.get_consumer(selected_c_id)
         pay_type = st.radio("Payment Type", ["Wallet Recharge", "Arrear Clearance"])
         if pay_type == "Wallet Recharge":
-            w_amt = st.number_input("Recharge Amount (₹)", value=500.0)
+            w_amt = st.number_input("Recharge Amount (₹)", min_value=0.0, value=500.0)
             if st.button("Process Recharge"):
-                PaymentEngine.process_recharge(c, w_amt)
-                st.success("Recharged!")
+                try:
+                    PaymentEngine.process_recharge(c, w_amt)
+                    st.success("Recharged!")
+                except ValueError as exc:
+                    st.error(str(exc))
         elif pay_type == "Arrear Clearance":
-            a_amt = st.number_input("Payment Amount (₹)", max_value=c.arrear_balance, value=min(1000.0, c.arrear_balance))
+            a_amt = st.number_input("Payment Amount (₹)", min_value=0.0, max_value=max(0.0, c.arrear_balance), value=min(1000.0, max(0.0, c.arrear_balance)))
             rec_days = st.slider("New Recovery Period (Days)", 30, 730, 365)
             if st.button("Process Arrear Payment"):
-                PaymentEngine.process_arrear_payment(c, a_amt, rec_days)
-                st.success("Arrear Processed.")
+                try:
+                    PaymentEngine.process_arrear_payment(c, a_amt, rec_days)
+                    st.success("Arrear Processed.")
+                except ValueError as exc:
+                    st.error(str(exc))
 
 # --- TAB 8: SETTLEMENT ---
 with tabs[7]:
