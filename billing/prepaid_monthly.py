@@ -5,13 +5,22 @@ class PrepaidMonthlyInvoice:
         summary = {
             "energy": 0,
             "fixed": 0,
+            "duty": 0,
             "dps": 0,
-            "installment": 0
+            "installment": 0,
+            "excessDemand": 0,
         }
 
         for e in ledger_entries:
-            if e["type"] in summary:
-                summary[e["type"].lower()] += e["amount"]
+            entry_type = e["type"].strip().lower()
+            aliases = {
+                "installment_recovery": "installment",
+                "excess_demand_penalty": "excessDemand",
+                "excessdemand": "excessDemand",
+            }
+            entry_type = aliases.get(entry_type, entry_type)
+            if entry_type in summary:
+                summary[entry_type] += e["amount"]
 
         return {
             "consumerId": consumer.consumer_id,

@@ -31,6 +31,13 @@ classifiers = [
 
 dependencies = []
 
+[project.optional-dependencies]
+api = ["fastapi>=0.115,<1.0", "pydantic>=2.9,<3.0", "uvicorn[standard]>=0.30,<1.0"]
+
+[tool.setuptools]
+py-modules = ["http_api"]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["voltengine*"]
+namespaces = true
+include = ["accounting*", "billing*", "engine*", "models*", "operations*", "tariff*"]
