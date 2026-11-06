@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import calendar
 import tempfile
 import os
@@ -75,7 +75,7 @@ class PDFGenerator:
         pdf.set_text_color(32, 74, 135)
         pdf.cell(0, 10, "VOLTENGINE DISCOM UTILITY", ln=True, align='C')
         pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 8, "POSTPAID TO PREPAID CONVERSION BILL", ln=True, align='C')
+        pdf.cell(0, 8, "NORMAL-TO-SMART CONVERSION BILL", ln=True, align='C')
         pdf.set_text_color(0, 0, 0)
         pdf.ln(5)
         
@@ -89,14 +89,14 @@ class PDFGenerator:
         pdf.cell(150, 7, f" {consumer.address}", border=1, ln=True)
         pdf.cell(40, 7, "Category & Load:", border=1)
         pdf.cell(150, 7, f" {consumer.category_id} | {consumer.load_kw} KW", border=1, ln=True)
-        pdf.cell(40, 7, "Migration Date:", border=1)
+        pdf.cell(40, 7, "Conversion Date:", border=1)
         pdf.cell(150, 7, f" {details['mig_date']}", border=1, ln=True)
         pdf.ln(5)
         
         # --- SECTION A: UNBILLED PERIOD ---
         PDFGenerator._draw_section_header(pdf, "A. UNBILLED PERIOD CALCULATION (FLAT RATE)")
         PDFGenerator._draw_row(pdf, "Previous Billed Reading", details['prev_r'])
-        PDFGenerator._draw_row(pdf, "Migration Day Reading", details['mig_r'], fill=True)
+        PDFGenerator._draw_row(pdf, "Conversion Day Reading", details['mig_r'], fill=True)
         PDFGenerator._draw_row(pdf, "Units for Unbilled Period", details['units'], is_bold=True)
         
         pdf.set_font("Arial", 'B', 10)
@@ -110,7 +110,7 @@ class PDFGenerator:
         PDFGenerator._draw_row(pdf, "Less: Subsidy:", f"-Rs. {details['subsidy']:.2f}")
         PDFGenerator._draw_row(pdf, "Fixed Charges (Prorated):", f"Rs. {details['fc']:.2f}")
         PDFGenerator._draw_row(pdf, "Electricity Duty:", f"Rs. {details['duty']:.2f}")
-        PDFGenerator._draw_row(pdf, "DPS (Delayed Payment Surcharge):", "Rs. 0.00")
+        PDFGenerator._draw_row(pdf, "DPS (Delayed Payment Surcharge):", f"Rs. {details.get('dps', 0):.2f}")
         PDFGenerator._draw_row(pdf, "Total Unbilled Amount:", f"Rs. {details['total_unbilled']:.2f}", is_bold=True, fill=True)
         pdf.ln(5)
 
@@ -414,6 +414,81 @@ class MigrationEngine:
         
         return c, pdf_details
 
+
+class MeterAssessmentEngine:
+    """Bihar Supply Code 9.16 energy assessment for a non-functional meter."""
+    @staticmethod
+    def assess_defective_meter(history_units, history_months, outage_days,
+                               previously_billed_units=0, check_meter_units=None,
+                               monthly_minimum_units=0):
+        vals = (history_units, outage_days, previously_billed_units,
+                monthly_minimum_units)
+        if any(not math.isfinite(float(v)) or float(v) < 0 for v in vals):
+            raise ValueError("Meter assessment values must be non-negative and finite.")
+        if history_months not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+            raise ValueError("History period must be between 1 and 12 months.")
+        if history_months < 12:
+            basis = "Actual functional history (new consumer / under 12 months)"
+        else:
+            basis = "Average consumption over previous 12 months (Bihar Supply Code 9.16)"
+        if check_meter_units is not None:
+            if not math.isfinite(float(check_meter_units)) or float(check_meter_units) < 0:
+                raise ValueError("Check-meter units must be non-negative and finite.")
+            assessed = float(check_meter_units)
+            basis = "Available check-meter reading"
+        else:
+            monthly_average = float(history_units) / history_months
+            assessed = max(monthly_average * float(outage_days) / 30.0,
+                           float(monthly_minimum_units) * float(outage_days) / 30.0)
+        adjustment = assessed - float(previously_billed_units)
+        return {
+            "basis": basis, "assessed_units": round(assessed, 2),
+            "previously_billed_units": float(previously_billed_units),
+            "adjustment_units": round(adjustment, 2),
+            "monthly_average": round(float(history_units) / history_months, 2)
+        }
+
+
+class LFDHEngine:
+    """Annexure 7 unauthorized-use assessment; never a defective-meter fallback."""
+    FACTORS = {"Domestic power": 0.30, "Agriculture": 0.30,
+               "Non-domestic": 0.50, "LT industrial": 0.50,
+               "High tension": 0.75, "Other listed category": 0.50}
+
+    @staticmethod
+    def assess(load_kw, factor, days, hours_per_day):
+        if any(not math.isfinite(float(v)) or float(v) < 0
+               for v in (load_kw, factor, days, hours_per_day)):
+            raise ValueError("LFDH inputs must be non-negative and finite.")
+        return round(float(load_kw) * float(factor) * float(days) *
+                     float(hours_per_day), 2)
+
+
+class DPSEngine:
+    """Estimate DPS on one unpaid bill principal under Bihar FY 2026-27 rules."""
+    @staticmethod
+    def calculate(principal, due_date, as_of_date, rate=0.015, grace_days=10):
+        if not math.isfinite(float(principal)) or float(principal) < 0:
+            raise ValueError("Outstanding bill principal must be non-negative and finite.")
+        elapsed_days = (as_of_date - due_date).days
+        if elapsed_days <= grace_days:
+            return {"months": 0, "dps": 0.0}
+        # 10-day grace applies, while any DPS due is reckoned from the bill's due date.
+        months = math.ceil(elapsed_days / 30)
+        return {"months": months, "dps": round(float(principal) * float(rate) * months, 2)}
+
+
+class DemandAssessmentEngine:
+    """Demand billing rule for tariff categories billed on recorded maximum demand."""
+    @staticmethod
+    def billing_demand(recorded_md_kw, contract_demand_kw):
+        if any(not math.isfinite(float(v)) or float(v) < 0
+               for v in (recorded_md_kw, contract_demand_kw)):
+            raise ValueError("Demand values must be non-negative and finite.")
+        floor = 0.75 * float(contract_demand_kw)
+        return {"billing_demand_kw": max(float(recorded_md_kw), floor),
+                "75pct_floor_kw": floor}
+
 class PrepaidDailyBilling:
     def run(self, consumer, units_normal, units_offpeak, units_peak, max_demand, date_val, is_meter_change=False, is_non_com=False):
         for label, value in (("Normal units", units_normal), ("Off-peak units", units_offpeak),
@@ -598,11 +673,11 @@ def show_guide():
     
     **Follow these 4 steps to test the engine:**
     
-    **1. 🔄 Migration (Postpaid to Prepaid)**
-    * Go to the **Migration** tab.
+    **1. 🔄 Normal-to-Smart Conversion**
+    * Go to the **Normal-to-Smart Conversion** tab.
     * Convert a legacy user to prepaid by calculating their unbilled units (flat-rate) and adjusting their security deposit. 
     
-    **2. 📟 Daily Readings (ToD DCC Engine)**
+    **2. 📟 Meter assessment and daily readings**
     * Go to the **Readings** tab.
     * Simulate smart meter daily pushes using the new ToD slots (Normal, Off-Peak, Peak).
     
@@ -632,7 +707,7 @@ if not HAS_FPDF:
 
 st.title("⚡ VoltEngine: Prepaid Billing  Simulator")
 
-tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Finance", "📅 Settlement", "📘 API Guide"])
+tabs = st.tabs(["⚙️ Masters", "🔄 Normal-to-Smart Conversion", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Finance", "📅 Settlement", "📘 API Guide"])
 
 # --- TAB 1: CATEGORY ---
 with tabs[0]:
@@ -640,27 +715,37 @@ with tabs[0]:
     for key, val in st.session_state.categories.items():
         with st.expander(f"{val['name']} ({key})"): st.json(val)
 
-# --- TAB 2: MIGRATION ---
+# --- TAB 2: NORMAL-TO-SMART CONVERSION ---
 with tabs[1]:
+    st.caption("Normal-to-Smart conversion closes the old normal-meter account and opens smart-prepaid service.")
     c1, c2, c3, c4 = st.columns(4)
     acc = c1.text_input("Old Acc", "KNO-001")
     cat = c1.selectbox("Category", list(st.session_state.categories.keys()))
-    arr = c2.number_input("Old Arrears", 3000.0)
+    arr = c2.number_input("Other old arrears (excluding the bill below)", min_value=0.0, value=0.0)
     sec = c2.number_input("Security Dep", 1000.0)
     ld = c3.number_input("Load (KW)", 2.0)
-    mig_date = c3.date_input("Migration Date")
+    mig_date = c3.date_input("Conversion Date")
     prev_r = c4.number_input("Prev Billed Reading", value=400.0)
-    curr_r = c4.number_input("Reading on Migration Day", value=450.0)
+    curr_r = c4.number_input("Reading on Conversion Day", value=450.0)
+    with st.expander("Calculate DPS on an unpaid previous bill"):
+        dps_col1, dps_col2 = st.columns(2)
+        dps_principal = dps_col1.number_input("Outstanding bill principal (₹; excludes DPS)", min_value=0.0, value=3000.0)
+        prior_due_date = dps_col1.date_input("Previous bill due date")
+        dps_col2.info(f"DPS calculated through conversion date: {mig_date}")
+        dps_result = DPSEngine.calculate(dps_principal, prior_due_date, mig_date)
+        st.metric("Estimated DPS at 1.5% per month", f"₹{dps_result['dps']:.2f}")
+        st.caption("After the 10-day grace, the FY 2026–27 Bihar tariff charges 1.5% per month on unpaid bill principal, reckoned from the printed due date. This single-bill estimate excludes DPS arrears and partial-payment allocation; use each bill's outstanding principal and due date separately for multiple bills. [BERC FY 2026–27 tariff order, DPS clause](https://berc.co.in/images/pdf/tariff-order/2026-27/DISCOMs_FO_TARIFF_CN_50_51_DT_180326.pdf)")
     
     # NEW: Error handling for backwards readings
     if prev_r > curr_r:
-        st.error("⚠️ Previous Billed Reading cannot be greater than the Migration Day Reading!")
+        st.error("⚠️ Previous Billed Reading cannot be greater than the Conversion Day Reading!")
     else:
-        if st.button("Migrate to Prepaid"):
+        if st.button("Convert to Smart Prepaid"):
             try:
-                c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
+                c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr + dps_principal + dps_result["dps"], sec, ld, prev_r, curr_r, mig_date)
+                pdf_details["dps"] = dps_result["dps"]
                 DataManager.save_consumer(c)
-                st.success(f"Migrated: {c.consumer_id}")
+                st.success(f"Converted: {c.consumer_id}")
                 st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.generate_conversion_bill(c, pdf_details)
             except (ValueError, TypeError) as exc:
                 st.error(str(exc))
@@ -708,6 +793,62 @@ with tabs[3]:
         with col2:
             st.subheader("2. Meter Replacement (MCO)")
             st.info("Ensure you process the final MCO DCC before applying a new meter.")
+
+        st.divider()
+        st.subheader("Defective meter energy assessment")
+        st.caption("For Bihar, Supply Code 9.16 uses the previous 12 months' average for an established consumer. For a new consumer with less than 12 months, use the actual period the meter worked. A check meter can be used when available. Enter units already billed during the outage so the result is an adjustment rather than a duplicate charge. [BERC Supply Code, clause 9.16](https://berc.co.in/images/pdf/Consolidated-Regl/supply-code-with-amend.pdf)")
+        with st.form("defective_meter_assessment"):
+            a1, a2, a3 = st.columns(3)
+            meter_event = a1.selectbox("Meter event", ["Defective", "Damaged", "Burnt", "Stolen"])
+            history_months = a1.selectbox("Available history (months)", list(range(1, 13)), index=11)
+            history_units = a1.number_input("Units in selected history", min_value=0.0, value=0.0)
+            out_of_order_date = a2.date_input("Meter out-of-order date")
+            replacement_date = a2.date_input("Meter replacement / assessment end date")
+            billed_units = a2.number_input("Units already billed for this period", min_value=0.0, value=0.0)
+            minimum_units = a3.number_input("Tariff minimum units per month (if applicable)", min_value=0.0, value=0.0)
+            check_units = a3.number_input("Check-meter units (0 = unavailable)", min_value=0.0, value=0.0)
+            run_assessment = st.form_submit_button("Calculate meter assessment")
+        if run_assessment:
+            try:
+                outage_days = (replacement_date - out_of_order_date).days
+                if outage_days <= 0:
+                    raise ValueError("Replacement / assessment end date must be after the out-of-order date.")
+                result = MeterAssessmentEngine.assess_defective_meter(
+                    history_units, history_months, outage_days, billed_units,
+                    check_units if check_units > 0 else None, minimum_units)
+                st.success(f"{meter_event} meter | {outage_days} days | Basis: {result['basis']}")
+                st.metric("Average monthly history", f"{result['monthly_average']:.2f} units")
+                st.metric("Assessed units for outage", f"{result['assessed_units']:.2f} units")
+                st.metric("Adjustment after prior provisional billing", f"{result['adjustment_units']:+.2f} units")
+                if history_months < 12:
+                    st.info("Less than 12 months selected: this is the new-consumer/functional-history path. Confirm meter commissioning history and the utility's application before posting.")
+            except ValueError as exc:
+                st.error(str(exc))
+
+        with st.expander("Defective MDI / maximum-demand assessment"):
+            st.caption("For Bihar demand-based tariffs, the FY 2026–27 tariff bills the higher of recorded maximum demand and 75% of contract demand. This is a billing-demand floor, not an estimate of missing energy consumption. [BERC FY 2026–27 tariff order](https://berc.co.in/images/pdf/tariff-order/2026-27/DISCOMs_FO_TARIFF_CN_50_51_DT_180326.pdf)")
+            mdi1, mdi2 = st.columns(2)
+            recorded_md = mdi1.number_input("Recorded maximum demand (kW; enter 0 if unavailable)", min_value=0.0, value=0.0)
+            contract_demand = mdi2.number_input("Contract demand (kW)", min_value=0.0, value=c.load_kw)
+            if st.button("Calculate billing demand"):
+                try:
+                    demand = DemandAssessmentEngine.billing_demand(recorded_md, contract_demand)
+                    st.metric("Billing demand", f"{demand['billing_demand_kw']:.2f} kW")
+                    st.caption(f"75% contract-demand floor: {demand['75pct_floor_kw']:.2f} kW. Confirm that this consumer is on a demand-based tariff before posting.")
+                except ValueError as exc:
+                    st.error(str(exc))
+
+        with st.expander("LFDH assessment — unauthorized use only"):
+            st.warning("Do not use LFDH for an ordinary defective or replaced meter. Bihar Annexure 7 uses it for assessment of unauthorized use; this calculator reports assessed units only. It uses L × F × D × H, 12 months maximum only when the period cannot be ascertained, and requires a reasoned assessment order.")
+            l1, l2 = st.columns(2)
+            lfdh_load = l1.number_input("Connected load L (kW)", min_value=0.0, value=2.0)
+            lfdh_category = l1.selectbox("Assessment category", list(LFDHEngine.FACTORS.keys()))
+            lfdh_days = l2.number_input("Days D (max 12 months if not ascertainable)", min_value=0, max_value=365, value=30)
+            lfdh_hours = l2.number_input("Average feeder supply hours/day H", min_value=0.0, max_value=24.0, value=12.0)
+            if st.button("Calculate LFDH units"):
+                assessed = LFDHEngine.assess(lfdh_load, LFDHEngine.FACTORS[lfdh_category], lfdh_days, lfdh_hours)
+                st.metric("Assessed units (L × F × D × H)", f"{assessed:.2f} kWh")
+                st.caption("The applicable assessment tariff and procedure must be applied separately by authorized utility staff.")
 
 # --- TAB 5: READINGS ---
 with tabs[4]:
