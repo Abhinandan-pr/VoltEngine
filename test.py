@@ -5,6 +5,7 @@ import calendar
 import tempfile
 import os
 import math
+from pathlib import Path
 
 # Attempt to import FPDF for PDF Generation
 try:
@@ -631,7 +632,7 @@ if not HAS_FPDF:
 
 st.title("⚡ VoltEngine: Prepaid Billing  Simulator")
 
-tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Finance", "📅 Settlement"])
+tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Finance", "📅 Settlement", "📘 API Guide"])
 
 # --- TAB 1: CATEGORY ---
 with tabs[0]:
@@ -818,3 +819,119 @@ with tabs[7]:
             if key in st.session_state and isinstance(st.session_state[key], bytes):
                 st.download_button(f"⬇️ Download Invoice PDF ({m})", data=st.session_state[key], 
                                    file_name=f"Invoice_{selected_c_id}_{m}.pdf", mime="application/pdf")
+
+# --- TAB 9: HTTP API GUIDE ---
+with tabs[8]:
+    st.header("VoltEngine Billing API Guide")
+    st.write("This guide explains how another app can call VoltEngine to calculate bills and recharge a wallet.")
+
+    api_pdf = Path(__file__).parent / "output" / "pdf" / "VoltEngine_API_Guide.pdf"
+    if api_pdf.is_file():
+        st.download_button(
+            "⬇️ Download the API Guide (PDF)",
+            data=api_pdf.read_bytes(),
+            file_name="VoltEngine_API_Guide.pdf",
+            mime="application/pdf",
+            key="download_api_guide",
+        )
+    else:
+        st.info("The downloadable guide PDF is not installed. See the API setup below or run docs/build_api_guide.py to create it.")
+
+    st.subheader("How a billing request works")
+    flow_cols = st.columns(4)
+    for col, step in zip(flow_cols, [
+        "1. Your system sends account, meter, and tariff data.",
+        "2. VoltEngine checks the API key and client IP.",
+        "3. The billing engine calculates charges and ledger lines.",
+        "4. Your system saves the returned balances and ledger.",
+    ]):
+        col.info(step)
+
+    st.warning("VoltEngine is stateless: it does not save consumer records or wallet balances. Your system must save the returned state and send the latest balances with the next request.")
+
+    st.subheader("1. Install and start the API service")
+    st.code(
+        'python -m pip install -e ".[api]"\n'
+        '$env:VOLTENGINE_API_KEYS = "replace-with-a-long-random-key"\n'
+        '$env:VOLTENGINE_ALLOWED_IPS = "203.0.113.10,198.51.100.0/24"\n'
+        'python -m uvicorn http_api:app --host 0.0.0.0 --port 8000',
+        language="powershell",
+    )
+    st.caption("Configure both environment variables on the API server. Replace sample keys and IPs with real approved values. Never commit API keys to source control.")
+
+    st.subheader("2. Understand the two allowlists")
+    st.markdown(
+        "- **API key:** send an approved key in the `X-API-Key` request header.\n"
+        "- **Client IP:** the request must originate from an approved IP address or CIDR range, such as `198.51.100.0/24`.\n"
+        "- Both checks must pass. If either allowlist is missing, billing endpoints return `503` and stay disabled.\n"
+        "- Behind a reverse proxy, configure trusted forwarded addresses only for that proxy. Do not trust arbitrary `X-Forwarded-For` values."
+    )
+
+    st.subheader("3. Available endpoints")
+    st.dataframe(pd.DataFrame([
+        {"Method": "GET", "Path": "/health", "Purpose": "Public service health check"},
+        {"Method": "POST", "Path": "/v1/billing/daily", "Purpose": "Calculate a daily prepaid bill"},
+        {"Method": "POST", "Path": "/v1/billing/monthly", "Purpose": "Summarize monthly ledger entries"},
+        {"Method": "POST", "Path": "/v1/billing/recharge", "Purpose": "Add wallet funds"},
+    ]), hide_index=True, use_container_width=True)
+    st.caption("All /v1/billing endpoints require both allowlists. Open /docs on the running API server for interactive request forms.")
+
+    st.subheader("Daily billing request")
+    st.write("Send JSON to `POST /v1/billing/daily`. The final tariff slab must have `upto: null` so every unit can be priced.")
+    st.code('''{
+  "consumer": {
+    "consumer_id": "C-1001",
+    "wallet_balance": 500.0,
+    "arrear_balance": 120.0,
+    "load_kw": 3.0,
+    "installment": {"total": 120.0, "daily": 2.0, "tenureDays": 60}
+  },
+  "meter": {"daily_units": 8.5, "max_demand_kw": 2.4},
+  "tariff": {
+    "slabs": [
+      {"upto": 50, "rate": 3.1},
+      {"upto": 100, "rate": 3.6},
+      {"upto": null, "rate": 4.1}
+    ],
+    "fixed_charge": 120,
+    "duty_rate": 0.05,
+    "dps_monthly_rate": 0.015,
+    "demand_rate": 250,
+    "excess_demand_multiplier": 1.5
+  },
+  "period_days": 30,
+  "billing_date": "2026-11-06"
+}''', language="json")
+    st.write("The response contains the total deduction, energy/fixed/duty/DPS/installment breakdown, updated wallet and arrear balances, and the ledger lines recorded for this calculation.")
+
+    with st.expander("Monthly invoice and recharge examples"):
+        st.markdown("**Monthly summary** - `POST /v1/billing/monthly`. Include `consumer_id`, current balances, a `YYYY-MM` month, and ledger entries with `type` and `amount`.")
+        st.code('''{
+  "consumer_id": "C-1001",
+  "wallet_balance": 466.27,
+  "arrear_balance": 118.06,
+  "month": "2026-11",
+  "ledger_entries": [
+    {"type": "ENERGY", "amount": 26.35},
+    {"type": "FIXED", "amount": 4.0},
+    {"type": "DUTY", "amount": 1.32}
+  ]
+}''', language="json")
+        st.markdown("**Recharge** - `POST /v1/billing/recharge`. Send the current balances, a positive `amount`, and optionally the current installment. The response returns the updated wallet balance.")
+        st.code('''{
+  "consumer_id": "C-1001",
+  "wallet_balance": 466.27,
+  "arrear_balance": 118.06,
+  "load_kw": 3.0,
+  "installment": {"total": 120.0, "daily": 2.0, "tenureDays": 60},
+  "amount": 500.0,
+  "revise_installment": true
+}''', language="json")
+
+    st.subheader("Common errors")
+    st.markdown(
+        "- `401`: the API key is missing or not allowlisted.\n"
+        "- `403`: the client IP is not allowlisted.\n"
+        "- `422`: the JSON is invalid or a tariff slab is incomplete.\n"
+        "- `503`: one or both allowlists have not been configured."
+    )
